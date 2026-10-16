@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>novadodge — a tiny arcade dodger</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; overflow: hidden; }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #05060a; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%);
+    color: #5a6b8c; font: 13px/1.4 ui-monospace, Menlo, Consolas, monospace;
+    letter-spacing: .04em; text-align: center; pointer-events: none; user-select: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<div id="hint">move mouse / drag to fly &middot; P pauses &middot; skim asteroids for near-miss points</div>
+
+<script id="novacore">
+"use strict";
+/* novacore — the entire game simulation. Deliberately DOM-free: no document,
+   no canvas, no Math.random inside the logic. Randomness comes from the
+   injected rng, so the sim is deterministic and the tests in tests/run.js can
+   drive it headlessly. The renderer below just draws whatever this says. */
+(function (root) {
+
+  var WORLD_W = 480;
+  var WORLD_H = 800;
+  var SHIP_R = 13;
+  var GRAZE_RING = 30;      // extra px past the hull that still counts as a near-miss
+  var SHIP_SPEED = 640;     // px/s the ship closes on the pointer
+  var INVULN_S = 2.0;       // mercy time after a hit
+  var TRICKLE_PER_S = 5;    // points for simply staying alive
+  var GRAZE_BASE = 10;
+  var MAX_ASTEROIDS = 42;
+
+  function newGame(rng) {
+    return {
+      phase: "playing",
+      rng: rng || Math.random,
+      time: 0,
+      score: 0,
+      mult: 1,
+      lives: 3,
+      ship: { x: WORLD_W / 2, y: WORLD_H * 0.72, invuln: 0 },
+      asteroids: [],
+      spawnTimer: 0.6,
+      events: []
+    };
+  }
+
+  // spawn gap shrinks as the run goes on; floors out so it stays fair
+  function spawnInterval(t) {
+    return Math.max(0.28, 1.05 - t * 0.009);
+  }
+
+  function spawnSpeed(t, rng) {
+    return 110 + t * 1.6 + rng() * 90;
+  }
+
+  function spawnAsteroid(g) {
+    var r = 12 + g.rng() * 22;
+    g.asteroids.push({
+      x: 20 + g.rng() * (WORLD_W - 40),
+      y: -r - 4,
+      vx: (g.rng() - 0.5) * 70,
+      vy: spawnSpeed(g.time, g.rng),
+      r: r,
+      grazed: false,
+      spin: g.rng() * 6.28,
+      spinV: (g.rng() - 0.5) * 3
+    });
+  }
+
+  var PHYS_HZ = 120; // physics runs at 120Hz so fast rocks can't tunnel through the ship
+
+  function update(g, dt, input) {
+    var ev = [];
+    // substep: big frame gaps (tab was hidden, slow device) must not let
+    // asteroids teleport past the ship between collision checks
+    var n = Math.max(1, Math.ceil(dt / (1 / PHYS_HZ)));
+    var h = dt / n;
+    for (var k = 0; k < n; k++) stepOnce(g, h, input, ev);
+    g.events = ev;
+    return ev;
+  }
+
+  function stepOnce(g, dt, input, ev) {
+    g.time += dt;
+    g.score += dt * TRICKLE_PER_S;
+
+    // ship steers toward the pointer target
+    var s = g.ship;
+    if (s.invuln > 0) s.invuln -= dt;
+    if (input && typeof input.tx === "number") {
+      var dx = input.tx - s.x, dy = input.ty - s.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var step = SHIP_SPEED * dt;
+      if (d <= step) { s.x = input.tx; s.y = input.ty; }
+      else { s.x += dx / d * step; s.y += dy / d * step; }
+    }
+    if (s.x < SHIP_R) s.x = SHIP_R;
+    if (s.x > WORLD_W - SHIP_R) s.x = WORLD_W - SHIP_R;
+    if (s.y < SHIP_R) s.y = SHIP_R;
+    if (s.y > WORLD_H - SHIP_R) s.y = WORLD_H - SHIP_R;
+
+    // spawn more debris as the nova keeps boiling
+    g.spawnTimer -= dt;
+    if (g.spawnTimer <= 0 && g.asteroids.length < MAX_ASTEROIDS) {
+      spawnAsteroid(g);
+      g.spawnTimer = spawnInterval(g.time);
+    }
+
+    // move asteroids, resolve grazes and hits
+    for (var i = g.asteroids.length - 1; i >= 0; i--) {
+      var a = g.asteroids[i];
+      a.x += a.vx * dt;
+      a.y += a.vy * dt;
+      a.spin += a.spinV * dt;
+      if (a.y - a.r > WORLD_H + 20) { g.asteroids.splice(i, 1); continue; }
+
+      var ddx = a.x - s.x, ddy = a.y - s.y;
+      var dist = Math.sqrt(ddx * ddx + ddy * ddy);
+      var hitR = SHIP_R + a.r;
+
+      if (dist < hitR) {
+        if (s.invuln <= 0) {
+          g.lives -= 1;
+          g.mult = 1;
+          s.invuln = INVULN_S;
+          ev.push({ t: "hit", x: s.x, y: s.y });
+          g.asteroids.splice(i, 1);
+          if (g.lives <= 0) {
+            g.phase = "gameover";
+            ev.push({ t: "gameover", score: Math.floor(g.score) });
+          }
+        }
+      } else if (dist < hitR + GRAZE_RING && !a.grazed) {
+        // skimmed it — the whole point of the game
+        a.grazed = true;
+        g.mult += 1;
+        var pts = GRAZE_BASE * g.mult;
+        g.score += pts;
+        ev.push({ t: "graze", x: a.x, y: a.y, mult: g.mult, pts: pts });
+      }
+    }
+  }
+
+  root.Novacore = {
+    WORLD_W: WORLD_W, WORLD_H: WORLD_H, SHIP_R: SHIP_R,
+    GRAZE_RING: GRAZE_RING, INVULN_S: INVULN_S, MAX_ASTEROIDS: MAX_ASTEROIDS,
+    newGame: newGame, update: update, spawnInterval: spawnInterval
+  };
+
+})(typeof window !== "undefined" ? window : globalThis);
+</script>
+<script>
+"use strict";
+/* renderer — canvas, input, sound, particles, overlays. Everything visual or
+   browser-y lives here; the sim above never knows about it. */
+(function () {
+  var C = Novacore;
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+
+  var DPR = Math.min(2, window.devicePixelRatio || 1);
+  var scale = 1; // world px -> screen px
+
+  function fit() {
+    var pad = 8;
+    scale = Math.min((window.innerWidth - pad) / C.WORLD_W,
+                     (window.innerHeight - pad) / C.WORLD_H);
+    canvas.width = Math.floor(C.WORLD_W * scale * DPR);
+    canvas.height = Math.floor(C.WORLD_H * scale * DPR);
+    canvas.style.width = Math.floor(C.WORLD_W * scale) + "px";
+    canvas.style.height = Math.floor(C.WORLD_H * scale) + "px";
+  }
+  window.addEventListener("resize", fit);
+  fit();
+
+  // ---- input: one virtual cursor, fed by mouse/touch/keys alike ----
+  var cursor = { x: C.WORLD_W / 2, y: C.WORLD_H * 0.72 };
+  var keys = {};
+
+  function toWorld(clientX, clientY) {
+    var r = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - r.left) / r.width * C.WORLD_W,
+      y: (clientY - r.top) / r.height * C.WORLD_H
+    };
+  }
+  canvas.addEventListener("pointermove", function (e) {
+    var p = toWorld(e.clientX, e.clientY);
+    cursor.x = p.x; cursor.y = p.y;
+  });
+  canvas.addEventListener("pointerdown", function (e) {
+    var p = toWorld(e.clientX, e.clientY);
+    cursor.x = p.x; cursor.y = p.y;
+    onTap();
+  });
+  window.addEventListener("keydown", function (e) {
+    keys[e.key.toLowerCase()] = true;
+    if (e.key === " ") { e.preventDefault(); onTap(); }
+    if (e.key.toLowerCase() === "p" && game.phase === "playing") paused = !paused;
+  });
+  window.addEventListener("keyup", function (e) { keys[e.key.toLowerCase()] = false; });
+
+  // ---- tiny synth, no audio files ----
+  var AC = null;
+  function audio() {
+    if (!AC) {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (Ctor) AC = new Ctor();
+    }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function beep(freq, dur, type, gain) {
+    var ac = audio();
+    if (!ac) return;
+    var o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(gain || 0.08, ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+    o.connect(g); g.connect(ac.destination);
+    o.start(); o.stop(ac.currentTime + dur);
+  }
+
+  // ---- game state ----
+  var game = C.newGame();
+  var paused = false;
+  var particles = [];
+  var floaters = []; // "+40 x3" text popups
+  var stars = [];
+  for (var li = 0; li < 3; li++) {
+    var layer = [];
+    var n = [70, 45, 25][li];
+    for (var si = 0; si < n; si++) {
+      layer.push({ x: Math.random() * C.WORLD_W, y: Math.random() * C.WORLD_H,
+                   s: [0.6, 1.1, 1.8][li], v: [12, 30, 60][li] });
+    }
+    stars.push(layer);
+  }
+  var best = 0;
+  try { best = parseInt(localStorage.getItem("novadodge.best") || "0", 10) || 0; } catch (e) { /* private mode */ }
+
+  function onTap() {
+    audio(); // unlock sound on first gesture
+    if (game.phase === "gameover") {
+      game = C.newGame();
+      particles = []; floaters = []; paused = false;
+    } else if (paused) {
+      paused = false;
+    }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden && game.phase === "playing") paused = true;
+  });
+
+  function handleEvents(ev) {
+    for (var i = 0; i < ev.length; i++) {
+      var e = ev[i];
+      if (e.t === "graze") {
+        beep(Math.min(1200, 440 * (1 + e.mult * 0.07)), 0.09, "sine", 0.06);
+        floaters.push({ x: e.x, y: e.y - 14, text: "+" + e.pts + "  x" + e.mult,
+                        life: 0.9, max: 0.9 });
+        for (var k = 0; k < 6; k++) {
+          particles.push({ x: e.x, y: e.y, vx: (Math.random() - 0.5) * 260,
+                           vy: (Math.random() - 0.5) * 260, life: 0.35, max: 0.35,
+                           c: "#7dd3fc" });
+        }
+      } else if (e.t === "hit") {
+        beep(110, 0.25, "square", 0.1);
+        for (var j = 0; j < 22; j++) {
+          particles.push({ x: e.x, y: e.y, vx: (Math.random() - 0.5) * 420,
+                           vy: (Math.random() - 0.5) * 420, life: 0.6, max: 0.6,
+                           c: j % 2 ? "#f87171" : "#fb923c" });
+        }
+      } else if (e.t === "gameover") {
+        beep(330, 0.3, "triangle", 0.09);
+        setTimeout(function () { beep(220, 0.4, "triangle", 0.09); }, 220);
+        if (e.score > best) {
+          best = e.score;
+          try { localStorage.setItem("novadodge.best", String(best)); } catch (err) { /* ignore */ }
+        }
+      }
+    }
+  }
+
+  // irregular rock shapes, cached per asteroid (visual only — sim doesn't care)
+  var polyCache = new WeakMap();
+  function rockPoly(a) {
+    var p = polyCache.get(a);
+    if (!p) {
+      p = [];
+      var n = 8 + Math.floor(Math.random() * 4);
+      for (var i = 0; i < n; i++) p.push(0.72 + Math.random() * 0.42);
+      polyCache.set(a, p);
+    }
+    return p;
+  }
+
+  function drawNova(t) {
+    var pulse = 1 + Math.sin(t * 1.4) * 0.06;
+    var g = ctx.createRadialGradient(C.WORLD_W / 2, -C.WORLD_H * 0.18, 10,
+                                     C.WORLD_W / 2, -C.WORLD_H * 0.18, 340 * pulse);
+    g.addColorStop(0, "rgba(255,214,170,0.55)");
+    g.addColorStop(0.25, "rgba(251,146,60,0.22)");
+    g.addColorStop(0.6, "rgba(124,58,237,0.10)");
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, C.WORLD_W, C.WORLD_H * 0.75);
+  }
+
+  function drawShip(x, y, invuln, t) {
+    ctx.save();
+    ctx.translate(x, y);
+    if (invuln > 0 && Math.floor(t * 12) % 2 === 0) ctx.globalAlpha = 0.35;
+    // engine flame
+    var flame = 10 + Math.random() * 8;
+    var fg = ctx.createLinearGradient(0, 10, 0, 10 + flame + 8);
+    fg.addColorStop(0, "rgba(125,211,252,0.9)");
+    fg.addColorStop(1, "rgba(125,211,252,0)");
+    ctx.fillStyle = fg;
+    ctx.beginPath();
+    ctx.moveTo(-5, 10); ctx.lineTo(5, 10); ctx.lineTo(0, 10 + flame + 8);
+    ctx.closePath(); ctx.fill();
+    // hull
+    ctx.fillStyle = "#e2e8f0";
+    ctx.beginPath();
+    ctx.moveTo(0, -14); ctx.lineTo(10, 10); ctx.lineTo(0, 5); ctx.lineTo(-10, 10);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#0ea5e9";
+    ctx.beginPath(); ctx.arc(0, -3, 3.4, 0, 6.29); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawAsteroid(a) {
+    var poly = rockPoly(a);
+    ctx.save();
+    ctx.translate(a.x, a.y);
+    ctx.rotate(a.spin);
+    ctx.beginPath();
+    for (var i = 0; i < poly.length; i++) {
+      var ang = i / poly.length * 6.2832;
+      var rr = a.r * poly[i];
+      if (i === 0) ctx.moveTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+      else ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+    }
+    ctx.closePath();
+    ctx.fillStyle = "#3f3f46";
+    ctx.fill();
+    ctx.strokeStyle = "#71717a";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // hot rim on the nova-facing side, subtle
+    ctx.strokeStyle = "rgba(251,146,60,0.35)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(0, 0, a.r * 0.92, -2.4, -0.7);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function text(str, x, y, size, color, align, bold) {
+    ctx.font = (bold ? "700 " : "400 ") + size + "px ui-monospace, Menlo, Consolas, monospace";
+    ctx.textAlign = align || "center";
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  function draw(t) {
+    ctx.setTransform(DPR * scale, 0, 0, DPR * scale, 0, 0);
+    ctx.fillStyle = "#05060a";
+    ctx.fillRect(0, 0, C.WORLD_W, C.WORLD_H);
+
+    // starfield
+    for (var li = 0; li < stars.length; li++) {
+      ctx.fillStyle = ["#1e293b", "#334155", "#64748b"][li];
+      var layer = stars[li];
+      for (var si = 0; si < layer.length; si++) {
+        var st = layer[si];
+        ctx.fillRect(st.x, st.y % C.WORLD_H, st.s, st.s);
+      }
+    }
+
+    drawNova(t);
+
+    for (var i = 0; i < game.asteroids.length; i++) drawAsteroid(game.asteroids[i]);
+
+    // particles + floaters
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      ctx.globalAlpha = Math.max(0, pt.life / pt.max);
+      ctx.fillStyle = pt.c;
+      ctx.fillRect(pt.x - 1.5, pt.y - 1.5, 3, 3);
+      ctx.globalAlpha = 1;
+    }
+    for (var f = floaters.length - 1; f >= 0; f--) {
+      var fl = floaters[f];
+      ctx.globalAlpha = Math.max(0, fl.life / fl.max);
+      text(fl.text, fl.x, fl.y, 15, "#7dd3fc", "center", true);
+      ctx.globalAlpha = 1;
+    }
+
+    if (game.phase === "playing") drawShip(game.ship.x, game.ship.y, game.ship.invuln, t);
+
+    // HUD
+    text(String(Math.floor(game.score)).padStart(6, "0"), 16, 34, 22, "#e2e8f0", "left", true);
+    if (game.mult > 1) text("x" + game.mult, C.WORLD_W / 2, 34, 22, "#fbbf24", "center", true);
+    for (var l = 0; l < 3; l++) {
+      ctx.save();
+      ctx.translate(C.WORLD_W - 20 - l * 26, 26);
+      ctx.globalAlpha = l < game.lives ? 1 : 0.18;
+      ctx.fillStyle = "#e2e8f0";
+      ctx.beginPath();
+      ctx.moveTo(0, -9); ctx.lineTo(7, 7); ctx.lineTo(0, 3); ctx.lineTo(-7, 7);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    if (game.phase !== "playing" || paused) {
+      ctx.fillStyle = "rgba(5,6,10,0.72)";
+      ctx.fillRect(0, 0, C.WORLD_W, C.WORLD_H);
+      if (paused && game.phase === "playing") {
+        text("PAUSED", C.WORLD_W / 2, C.WORLD_H / 2 - 10, 34, "#e2e8f0", "center", true);
+        text("P or tap to resume", C.WORLD_W / 2, C.WORLD_H / 2 + 26, 15, "#94a3b8");
+      } else {
+        text("NOVADODGE", C.WORLD_W / 2, C.WORLD_H / 2 - 90, 44, "#f8fafc", "center", true);
+        text("thread the nova's debris field", C.WORLD_W / 2, C.WORLD_H / 2 - 52, 15, "#94a3b8");
+        text("skim asteroids — don't touch them", C.WORLD_W / 2, C.WORLD_H / 2 - 26, 15, "#94a3b8");
+        if (best > 0) text("best  " + best, C.WORLD_W / 2, C.WORLD_H / 2 + 12, 16, "#fbbf24", "center", true);
+        text(game.phase === "gameover" ? "score " + Math.floor(game.score) : "",
+             C.WORLD_W / 2, C.WORLD_H / 2 + 40, 18, "#e2e8f0", "center", true);
+        if (Math.floor(t * 1.6) % 2 === 0)
+          text(game.phase === "gameover" ? "click / space to fly again" : "click / space to launch",
+               C.WORLD_W / 2, C.WORLD_H / 2 + 84, 16, "#7dd3fc", "center", true);
+      }
+    }
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    var t = now / 1000;
+
+    // starfield drift (visual only)
+    for (var li = 0; li < stars.length; li++) {
+      var layer = stars[li];
+      for (var si = 0; si < layer.length; si++) {
+        layer[si].y += layer[si].v * dt;
+        if (layer[si].y > C.WORLD_H) layer[si].y -= C.WORLD_H;
+      }
+    }
+    // particles + floaters
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+      if (pt.life <= 0) particles.splice(p, 1);
+    }
+    for (var f = floaters.length - 1; f >= 0; f--) {
+      var fl = floaters[f];
+      fl.y -= 34 * dt; fl.life -= dt;
+      if (fl.life <= 0) floaters.splice(f, 1);
+    }
+
+    if (game.phase === "playing" && !paused) {
+      // keyboard nudges the same virtual cursor the mouse drives
+      var kv = 520 * dt;
+      if (keys["arrowleft"] || keys["a"]) cursor.x -= kv;
+      if (keys["arrowright"] || keys["d"]) cursor.x += kv;
+      if (keys["arrowup"] || keys["w"]) cursor.y -= kv;
+      if (keys["arrowdown"] || keys["s"]) cursor.y += kv;
+      var ev = C.update(game, dt, { tx: cursor.x, ty: cursor.y });
+      handleEvents(ev);
+    }
+
+    draw(t);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
